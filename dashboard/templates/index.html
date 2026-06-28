@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>XAUUSD Scalper — Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:       #0d0f14;
+      --surface:  #151820;
+      --border:   #1e2230;
+      --accent:   #f0b429;
+      --green:    #22c55e;
+      --red:      #ef4444;
+      --muted:    #6b7280;
+      --text:     #e5e7eb;
+      --subtext:  #9ca3af;
+      --radius:   12px;
+      --font:     'Inter', 'Segoe UI', system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 18px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+    .logo h1 { font-size: 18px; font-weight: 700; letter-spacing: 0.3px; }
+    .logo span { color: var(--accent); }
+    .header-meta { font-size: 12px; color: var(--muted); text-align: right; line-height: 1.6; }
+
+    /* ── Layout ── */
+    main {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 28px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    /* ── Strategy badge ── */
+    .strategy-bar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .strategy-bar .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+    .badge {
+      background: #1a1f2e;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    /* ── KPI cards ── */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 16px;
+    }
+    .kpi {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      position: relative;
+      overflow: hidden;
+    }
+    .kpi::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: var(--accent);
+      opacity: 0.6;
+    }
+    .kpi.green::before { background: var(--green); }
+    .kpi.red::before   { background: var(--red); }
+    .kpi-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 10px; }
+    .kpi-value { font-size: 26px; font-weight: 700; line-height: 1; }
+    .kpi-sub   { font-size: 12px; color: var(--subtext); margin-top: 6px; }
+    .up   { color: var(--green); }
+    .down { color: var(--red); }
+
+    /* ── Charts row ── */
+    .charts-row {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--subtext);
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-bottom: 18px;
+    }
+
+    .chart-wrap { position: relative; width: 100%; }
+    .chart-wrap.tall { height: 260px; }
+    .chart-wrap.mid  { height: 220px; }
+
+    /* ── Win/loss donut ── */
+    .donut-center {
+      position: absolute;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      pointer-events: none;
+    }
+    .donut-center .big  { font-size: 28px; font-weight: 700; }
+    .donut-center .tiny { font-size: 11px; color: var(--muted); }
+
+    /* ── Weekly bar ── */
+    .weekly-row { display: grid; grid-template-columns: 1fr; gap: 16px; }
+
+    /* ── Trade table ── */
+    .table-wrap {
+      overflow-x: auto;
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead th {
+      padding: 10px 14px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.7px;
+      background: #0f1117;
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+    tbody tr:hover { background: #1a1f2e; }
+    tbody td { padding: 10px 14px; }
+    .pill {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .pill.win  { background: rgba(34,197,94,0.12);  color: var(--green); }
+    .pill.loss { background: rgba(239,68,68,0.12);  color: var(--red); }
+    .pill.buy  { background: rgba(240,180,41,0.12); color: var(--accent); }
+    .pill.sell { background: rgba(99,102,241,0.15); color: #a5b4fc; }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      padding: 24px;
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 900px) {
+      .charts-row { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 600px) {
+      header { flex-direction: column; gap: 12px; text-align: center; }
+      .kpi-grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    /* ── Loading ── */
+    .loading { color: var(--muted); font-size: 14px; padding: 40px; text-align: center; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    <h1>XAUUSD <span>Scalper</span> Dashboard</h1>
+  </div>
+  <div class="header-meta">
+    <div id="strategy-label">Loading strategy…</div>
+    <div id="generated-at"></div>
+  </div>
+</header>
+
+<main>
+
+  <!-- Strategy bar -->
+  <div class="strategy-bar">
+    <span class="label">Strategy</span>
+    <span class="badge" id="badge-strategy">—</span>
+    <span class="badge">M1 Scalper</span>
+    <span class="badge">XAUUSD</span>
+    <span class="badge" id="badge-risk">—% Risk / Trade</span>
+    <span class="badge" id="badge-sl">SL × —</span>
+    <span class="badge" id="badge-tp">TP × —</span>
+    <span class="badge">London + NY Sessions</span>
+  </div>
+
+  <!-- KPI cards -->
+  <div class="kpi-grid">
+    <div class="kpi green">
+      <div class="kpi-label">Final Balance</div>
+      <div class="kpi-value" id="kpi-balance">—</div>
+      <div class="kpi-sub" id="kpi-balance-sub">—</div>
+    </div>
+    <div class="kpi" id="kpi-pnl-card">
+      <div class="kpi-label">Net P&amp;L</div>
+      <div class="kpi-value" id="kpi-pnl">—</div>
+      <div class="kpi-sub" id="kpi-pnl-sub">—</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Total Trades</div>
+      <div class="kpi-value" id="kpi-trades">—</div>
+      <div class="kpi-sub" id="kpi-wl">— W / — L</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Win Rate</div>
+      <div class="kpi-value" id="kpi-wr">—</div>
+      <div class="kpi-sub">of all closed trades</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Profit Factor</div>
+      <div class="kpi-value" id="kpi-pf">—</div>
+      <div class="kpi-sub">gross profit ÷ gross loss</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Reward / Risk</div>
+      <div class="kpi-value" id="kpi-rr">—</div>
+      <div class="kpi-sub" id="kpi-rr-sub">avg win / avg loss</div>
+    </div>
+    <div class="kpi red">
+      <div class="kpi-label">Max Drawdown</div>
+      <div class="kpi-value down" id="kpi-dd">—</div>
+      <div class="kpi-sub">peak-to-trough</div>
+    </div>
+  </div>
+
+  <!-- Equity + Donut row -->
+  <div class="charts-row">
+    <div class="card">
+      <div class="card-title">Equity Curve</div>
+      <div class="chart-wrap tall">
+        <canvas id="equityChart"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Win / Loss Split</div>
+      <div class="chart-wrap mid" style="position:relative;">
+        <canvas id="donutChart"></canvas>
+        <div class="donut-center">
+          <div class="big up" id="donut-wr">—</div>
+          <div class="tiny">Win Rate</div>
+        </div>
+      </div>
+      <div style="margin-top:16px; display:flex; gap:16px; justify-content:center; font-size:13px;">
+        <span><span style="color:var(--green)">●</span> Wins: <b id="stat-wins">—</b></span>
+        <span><span style="color:var(--red)">●</span> Losses: <b id="stat-losses">—</b></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Weekly PnL bar chart -->
+  <div class="card">
+    <div class="card-title">Weekly P&amp;L ($)</div>
+    <div class="chart-wrap" style="height:200px;">
+      <canvas id="weeklyChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Trade table -->
+  <div class="card">
+    <div class="card-title">All Trades</div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Time</th>
+            <th>Direction</th>
+            <th>Entry</th>
+            <th>Exit</th>
+            <th>SL</th>
+            <th>TP</th>
+            <th>Lot</th>
+            <th>P&amp;L (USD)</th>
+            <th>Balance</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody id="trade-tbody">
+          <tr><td colspan="11" class="loading">Loading trades…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+
+<footer>
+  XAUUSD Scalper Bot — Backtest simulation on synthetic data calibrated to real gold statistics.
+  Not financial advice.
+</footer>
+
+<script>
+const fmt = (n, d=2) => n.toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d});
+const fmtUSD = n => (n >= 0 ? '+' : '') + '$' + fmt(Math.abs(n));
+
+// ── Chart defaults ──────────────────────────────────────────────────────────
+Chart.defaults.color = '#6b7280';
+Chart.defaults.font.family = 'Inter, Segoe UI, system-ui, sans-serif';
+Chart.defaults.font.size = 12;
+
+let equityChart, donutChart, weeklyChart;
+
+// ── Fetch and render ────────────────────────────────────────────────────────
+async function loadAll() {
+  const [metrics, equity, trades, weekly] = await Promise.all([
+    fetch('/api/metrics').then(r => r.json()),
+    fetch('/api/equity').then(r => r.json()),
+    fetch('/api/trades').then(r => r.json()),
+    fetch('/api/weekly').then(r => r.json()),
+  ]);
+
+  renderMetrics(metrics);
+  renderEquity(equity, metrics.starting_balance);
+  renderDonut(metrics.wins, metrics.losses, metrics.win_rate);
+  renderWeekly(weekly);
+  renderTable(trades);
+}
+
+// ── Metrics ──────────────────────────────────────────────────────────────────
+function renderMetrics(m) {
+  document.getElementById('strategy-label').textContent = m.strategy;
+  document.getElementById('generated-at').textContent   = 'Generated ' + m.generated_at;
+
+  document.getElementById('badge-strategy').textContent = m.strategy;
+  document.getElementById('badge-risk').textContent     = m.risk_pct + '% Risk / Trade';
+  document.getElementById('badge-sl').textContent       = 'SL × ' + m.sl_mult;
+  document.getElementById('badge-tp').textContent       = 'TP × ' + m.tp_mult;
+
+  document.getElementById('kpi-balance').textContent    = '$' + fmt(m.final_balance);
+  document.getElementById('kpi-balance-sub').textContent = 'Started at $' + fmt(m.starting_balance);
+
+  const pnl = m.net_pnl;
+  document.getElementById('kpi-pnl').innerHTML =
+    `<span class="${pnl>=0?'up':'down'}">${fmtUSD(pnl)}</span>`;
+  document.getElementById('kpi-pnl-sub').textContent =
+    (pnl >= 0 ? '▲ ' : '▼ ') + Math.abs(m.pct_return) + '% return';
+
+  document.getElementById('kpi-trades').textContent  = m.total_trades;
+  document.getElementById('kpi-wl').textContent      = m.wins + ' W / ' + m.losses + ' L';
+  document.getElementById('kpi-wr').innerHTML        = `<span class="up">${m.win_rate}%</span>`;
+  document.getElementById('kpi-pf').textContent      = m.profit_factor;
+  document.getElementById('kpi-rr').textContent      = m.rr_ratio + 'x';
+  document.getElementById('kpi-rr-sub').textContent  =
+    'Avg W $' + fmt(Math.abs(m.avg_win)) + ' / Avg L $' + fmt(Math.abs(m.avg_loss));
+  document.getElementById('kpi-dd').textContent      = m.max_drawdown + '%';
+}
+
+// ── Equity curve ─────────────────────────────────────────────────────────────
+function renderEquity(equity, start) {
+  const labels = equity.map(p => p.x);
+  const values = equity.map(p => p.y);
+  const colors = values.map(v => v >= start ? 'rgba(34,197,94,0.8)' : 'rgba(239,68,68,0.8)');
+
+  const ctx = document.getElementById('equityChart').getContext('2d');
+  const gradient = ctx.createLinearGradient(0, 0, 0, 260);
+  gradient.addColorStop(0, 'rgba(34,197,94,0.25)');
+  gradient.addColorStop(1, 'rgba(34,197,94,0.0)');
+
+  equityChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        borderColor: '#22c55e',
+        borderWidth: 2,
+        pointRadius: 0,
+        fill: true,
+        backgroundColor: gradient,
+        tension: 0.3,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: {
+        callbacks: {
+          label: ctx => ' $' + fmt(ctx.parsed.y),
+          title: ctx => 'Trade #' + ctx[0].label,
+        }
+      }},
+      scales: {
+        x: { display: false },
+        y: {
+          grid: { color: '#1e2230' },
+          ticks: { callback: v => '$' + (v/1000).toFixed(0) + 'k' },
+        }
+      }
+    }
+  });
+}
+
+// ── Donut ─────────────────────────────────────────────────────────────────────
+function renderDonut(wins, losses, wr) {
+  document.getElementById('donut-wr').textContent  = wr + '%';
+  document.getElementById('stat-wins').textContent = wins;
+  document.getElementById('stat-losses').textContent = losses;
+
+  donutChart = new Chart(document.getElementById('donutChart'), {
+    type: 'doughnut',
+    data: {
+      labels: ['Wins', 'Losses'],
+      datasets: [{
+        data: [wins, losses],
+        backgroundColor: ['rgba(34,197,94,0.8)', 'rgba(239,68,68,0.7)'],
+        borderColor:     ['#22c55e', '#ef4444'],
+        borderWidth: 2,
+        hoverOffset: 6,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: '72%',
+      plugins: { legend: { display: false } }
+    }
+  });
+}
+
+// ── Weekly bar ────────────────────────────────────────────────────────────────
+function renderWeekly(weekly) {
+  const labels = weekly.map(w => w.week.split('/')[0]);
+  const values = weekly.map(w => w.pnl);
+  const colors = values.map(v => v >= 0 ? 'rgba(34,197,94,0.75)' : 'rgba(239,68,68,0.75)');
+  const borders= values.map(v => v >= 0 ? '#22c55e' : '#ef4444');
+
+  weeklyChart = new Chart(document.getElementById('weeklyChart'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        data: values,
+        backgroundColor: colors,
+        borderColor: borders,
+        borderWidth: 1,
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: {
+        callbacks: { label: ctx => ' $' + fmt(ctx.parsed.y) }
+      }},
+      scales: {
+        x: { grid: { display: false }, ticks: { maxRotation: 45 } },
+        y: {
+          grid: { color: '#1e2230' },
+          ticks: { callback: v => '$' + (v/1000).toFixed(0) + 'k' },
+        }
+      }
+    }
+  });
+}
+
+// ── Trade table ───────────────────────────────────────────────────────────────
+function renderTable(trades) {
+  const tbody = document.getElementById('trade-tbody');
+  if (!trades.length) {
+    tbody.innerHTML = '<tr><td colspan="11" class="loading">No trades found.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = trades.map((t, i) => {
+    const pnl    = t.pnl_usd;
+    const pnlCls = pnl >= 0 ? 'up' : 'down';
+    const dirCls = t.direction === 'BUY' ? 'buy' : 'sell';
+    const resCls = t.result === 'WIN'    ? 'win' : 'loss';
+    return `
+      <tr>
+        <td style="color:var(--muted)">${i+1}</td>
+        <td>${t.time}</td>
+        <td><span class="pill ${dirCls}">${t.direction}</span></td>
+        <td>${fmt(t.entry)}</td>
+        <td>${fmt(t.exit)}</td>
+        <td style="color:var(--red)">${fmt(t.sl)}</td>
+        <td style="color:var(--green)">${fmt(t.tp)}</td>
+        <td>${t.lot}</td>
+        <td class="${pnlCls}"><b>${fmtUSD(pnl)}</b></td>
+        <td>$${fmt(t.balance)}</td>
+        <td><span class="pill ${resCls}">${t.result}</span></td>
+      </tr>`;
+  }).join('');
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+loadAll().catch(console.error);
+</script>
+</body>
+</html>
