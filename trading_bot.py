@@ -1,14 +1,14 @@
 """
-MT5 Automated Trading Bot
-Modular, production-grade implementation with dynamic position sizing,
-risk management, and a continuous execution loop.
+MT5 Automated Trading Bot — XAUUSD M1 Scalper
+Strategy: EMA 9/21 Cross + RSI(7) Momentum + ATR(14) Dynamic SL/TP
+           with London/New York session filter and spread guard.
 """
 
 import time
 import logging
 import sys
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Optional, Tuple
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -31,57 +31,76 @@ log = logging.getLogger(__name__)
 # SECTION 1 — CONFIGURATION
 # ---------------------------------------------------------------------------
 
-SYMBOL      = "XAUUSD"       # Trading instrument
-TIMEFRAME   = mt5.TIMEFRAME_M15
-CANDLES     = 200             # Historical candles to fetch for analysis
-LOOP_SLEEP  = 60              # Seconds between each loop iteration
+SYMBOL    = "XAUUSD"
+TIMEFRAME = mt5.TIMEFRAME_M1
+CANDLES   = 300           # Enough history for all indicators to warm up
+LOOP_SLEEP = 60           # Seconds between loop iterations (1 candle = 60 s)
 
-# Risk: fraction of balance to risk per trade
-RISK_FRACTION = 0.20          # 20%
+# Risk management
+RISK_FRACTION = 0.20      # 20% of balance risked per trade
 
-# Hard-coded SL / TP distances in POINTS (1 point = smallest price move)
-# Override these per-symbol as needed.
-SL_POINTS = 150               # Stop-loss distance in points
-TP_POINTS = 300               # Take-profit distance in points  (1:2 R/R)
+# ATR multipliers — SL = ATR * SL_ATR_MULT, TP = ATR * TP_ATR_MULT (1:2 R/R)
+SL_ATR_MULT = 1.5
+TP_ATR_MULT = 3.0
 
-# Minimum/maximum lot sizes allowed (broker-specific, adjust as needed)
+# Spread guard: skip trade if live spread exceeds this many points
+MAX_SPREAD_POINTS = 30    # ~3 pips on XAUUSD (adjust per broker)
+
+# Lot size limits
 LOT_MIN  = 0.01
 LOT_MAX  = 100.0
-LOT_STEP = 0.01               # Lot rounding step
+LOT_STEP = 0.01
 
-MAGIC_NUMBER = 20240101       # Unique magic number to identify bot orders
-SLIPPAGE     = 10             # Max slippage in points
+MAGIC_NUMBER = 20240102
+SLIPPAGE     = 10         # Max deviation in points
+
+# ---------------------------------------------------------------------------
+# Active trading sessions (UTC hours, inclusive).
+# Gold is most liquid during London (07–12) and New York (13–17) overlap.
+# ---------------------------------------------------------------------------
+SESSIONS = [
+    (7, 12),   # London
+    (13, 17),  # New York
+]
+
+# ---------------------------------------------------------------------------
+# Strategy indicator parameters
+# ---------------------------------------------------------------------------
+EMA_FAST  = 9
+EMA_SLOW  = 21
+RSI_LEN   = 7
+ATR_LEN   = 14
+
+# RSI thresholds
+RSI_BUY_MIN  = 50    # RSI must be above this to confirm BUY momentum
+RSI_SELL_MAX = 50    # RSI must be below this to confirm SELL momentum
+RSI_OB       = 75    # Overbought — suppress BUY signals
+RSI_OS       = 25    # Oversold  — suppress SELL signals
 
 
 # ---------------------------------------------------------------------------
-# SECTION 2 — MT5 CONNECTION HELPERS
+# SECTION 2 — MT5 CONNECTION
 # ---------------------------------------------------------------------------
 
 def connect_mt5(login: Optional[int] = None,
                 password: Optional[str] = None,
                 server: Optional[str] = None) -> bool:
-    """
-    Initialize and authenticate with the MT5 terminal.
-
-    Parameters can be omitted to reuse the terminal's active session.
-    Returns True on success, False on failure.
-    """
+    """Initialize MT5 terminal connection. Returns True on success."""
     if not mt5.initialize(login=login, password=password, server=server):
-        log.error("mt5.initialize() failed — error: %s", mt5.last_error())
+        log.error("mt5.initialize() failed — %s", mt5.last_error())
         return False
 
     info = mt5.terminal_info()
     if info is None:
-        log.error("Could not retrieve terminal info after init.")
+        log.error("terminal_info() returned None after init.")
         mt5.shutdown()
         return False
 
-    log.info("MT5 connected  |  build=%s  |  connected=%s", info.build, info.connected)
+    log.info("MT5 connected | build=%s | connected=%s", info.build, info.connected)
     return True
 
 
 def shutdown_mt5() -> None:
-    """Cleanly close the MT5 connection."""
     mt5.shutdown()
     log.info("MT5 connection closed.")
 
@@ -92,12 +111,8 @@ def shutdown_mt5() -> None:
 
 def fetch_candles(symbol: str, timeframe: int, count: int) -> Optional[pd.DataFrame]:
     """
-    Fetch the most recent `count` completed OHLCV candles for `symbol`.
-
-    Returns a DataFrame with columns: time, open, high, low, close, tick_volume.
-    The most recent (potentially incomplete) candle is excluded by dropping index 0
-    from the tail — MT5 returns candles newest-last, so we drop the last row.
-    Returns None on error.
+    Fetch `count` completed OHLCV candles.
+    The live (still-forming) candle is always stripped before returning.
     """
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count + 1)
     if rates is None or len(rates) == 0:
@@ -105,188 +120,241 @@ def fetch_candles(symbol: str, timeframe: int, count: int) -> Optional[pd.DataFr
         return None
 
     df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s")
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
     df = df.rename(columns={"tick_volume": "volume"})
-
-    # Drop the last row: it is the still-forming current candle
-    df = df.iloc[:-1].reset_index(drop=True)
-
+    df = df.iloc[:-1].reset_index(drop=True)   # drop live candle
     return df[["time", "open", "high", "low", "close", "volume"]]
 
 
-# ---------------------------------------------------------------------------
-# SECTION 4 — STRATEGY / SIGNAL ENGINE
-# ---------------------------------------------------------------------------
-
-def compute_signal(df: pd.DataFrame) -> str:
-    """
-    Analyse the OHLCV DataFrame and return 'BUY', 'SELL', or 'HOLD'.
-
-    This function implements a dual-EMA crossover strategy as a reference.
-    Replace or extend with: ICT order blocks, liquidity sweeps, RSI divergence,
-    Bollinger Bands, price-action patterns, or any custom logic.
-
-    Strategy (EMA 20 / EMA 50 crossover):
-      - BUY  when fast EMA crosses above slow EMA on the latest closed candle
-      - SELL when fast EMA crosses below slow EMA on the latest closed candle
-      - HOLD otherwise
-    """
-    if len(df) < 60:
-        log.warning("Not enough candles to compute signal (%d < 60).", len(df))
-        return "HOLD"
-
-    close = df["close"]
-
-    # --- Indicator computation ---
-    ema_fast = close.ewm(span=20, adjust=False).mean()
-    ema_slow = close.ewm(span=50, adjust=False).mean()
-
-    # Current vs previous bar values
-    curr_fast, prev_fast = ema_fast.iloc[-1], ema_fast.iloc[-2]
-    curr_slow, prev_slow = ema_slow.iloc[-1], ema_slow.iloc[-2]
-
-    bullish_cross = (prev_fast <= prev_slow) and (curr_fast > curr_slow)
-    bearish_cross = (prev_fast >= prev_slow) and (curr_fast < curr_slow)
-
-    # --- Optional: Add confluence filters here ---
-    # e.g., RSI, ATR, session time, spread check, higher-timeframe bias, etc.
-
-    if bullish_cross:
-        log.info("Signal: BUY  (EMA%d crossed above EMA%d)", 20, 50)
-        return "BUY"
-
-    if bearish_cross:
-        log.info("Signal: SELL (EMA%d crossed below EMA%d)", 20, 50)
-        return "SELL"
-
-    log.info("Signal: HOLD (no crossover detected)")
-    return "HOLD"
-
-
-# ---------------------------------------------------------------------------
-# SECTION 5 — DYNAMIC POSITION SIZING & RISK MANAGEMENT
-# ---------------------------------------------------------------------------
-
-def get_account_balance() -> Optional[float]:
-    """Fetch live account balance. Returns None on failure."""
-    info = mt5.account_info()
+def get_live_spread(symbol: str) -> Optional[float]:
+    """Return current spread in points, or None on error."""
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+    info = mt5.symbol_info(symbol)
     if info is None:
-        log.error("mt5.account_info() failed — %s", mt5.last_error())
         return None
-    return info.balance
-
-
-def calculate_lot_size(symbol: str, sl_points: int) -> Optional[float]:
-    """
-    Calculate lot size so that a stop-loss hit equals exactly RISK_FRACTION
-    of the current account balance.
-
-    Formula:
-        cash_at_risk  = balance * RISK_FRACTION
-        pip_value     = (contract_size * point) / price   [for non-USD quote]
-        lot_size      = cash_at_risk / (sl_points * value_per_point_per_lot)
-
-    MT5 provides tick_value (profit/loss per 1 lot per 1 tick move) and
-    tick_size (size of 1 tick in price terms). We convert sl_points to ticks:
-        ticks_in_sl = sl_points * point / tick_size
-        risk_per_lot = ticks_in_sl * tick_value
-
-    Returns the rounded lot size, or None on any failure.
-    """
-    balance = get_account_balance()
-    if balance is None:
-        return None
-
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        log.error("symbol_info() failed for %s — %s", symbol, mt5.last_error())
-        return None
-
-    if not symbol_info.visible:
-        # Attempt to make symbol visible in Market Watch
-        if not mt5.symbol_select(symbol, True):
-            log.error("Cannot select symbol %s.", symbol)
-            return None
-
-    point      = symbol_info.point          # Smallest price increment
-    tick_size  = symbol_info.trade_tick_size
-    tick_value = symbol_info.trade_tick_value
-
-    if tick_size == 0 or tick_value == 0:
-        log.error("Invalid tick data for %s: tick_size=%s tick_value=%s",
-                  symbol, tick_size, tick_value)
-        return None
-
-    cash_at_risk    = balance * RISK_FRACTION
-    sl_price_range  = sl_points * point
-    ticks_in_sl     = sl_price_range / tick_size
-    risk_per_lot    = ticks_in_sl * tick_value
-
-    if risk_per_lot <= 0:
-        log.error("risk_per_lot is non-positive (%s); cannot size position.", risk_per_lot)
-        return None
-
-    raw_lot = cash_at_risk / risk_per_lot
-
-    # Round down to the nearest LOT_STEP and clamp within broker limits
-    lot = max(LOT_MIN, min(LOT_MAX, round(raw_lot - (raw_lot % LOT_STEP), 2)))
-
-    log.info(
-        "Position sizing | balance=%.2f | risk=%.2f%% | cash_at_risk=%.2f | "
-        "sl_points=%d | risk_per_lot=%.4f | raw_lot=%.4f | lot=%.2f",
-        balance, RISK_FRACTION * 100, cash_at_risk,
-        sl_points, risk_per_lot, raw_lot, lot,
-    )
-    return lot
+    return round((tick.ask - tick.bid) / info.point)
 
 
 # ---------------------------------------------------------------------------
-# SECTION 6 — OPEN POSITION DETECTION
+# SECTION 4 — INDICATORS
 # ---------------------------------------------------------------------------
 
-def has_open_position(symbol: str) -> bool:
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, period: int) -> pd.Series:
+    """Wilder's RSI (standard implementation)."""
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _atr(df: pd.DataFrame, period: int) -> pd.Series:
+    """Average True Range."""
+    hl  = df["high"] - df["low"]
+    hc  = (df["high"] - df["close"].shift()).abs()
+    lc  = (df["low"]  - df["close"].shift()).abs()
+    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach EMA fast/slow, RSI, and ATR columns to the DataFrame."""
+    df = df.copy()
+    df["ema_fast"] = _ema(df["close"], EMA_FAST)
+    df["ema_slow"] = _ema(df["close"], EMA_SLOW)
+    df["rsi"]      = _rsi(df["close"], RSI_LEN)
+    df["atr"]      = _atr(df, ATR_LEN)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# SECTION 5 — SESSION FILTER
+# ---------------------------------------------------------------------------
+
+def is_active_session() -> bool:
     """
-    Return True if there is already an open position for `symbol` opened
-    by this bot (identified by MAGIC_NUMBER).
+    Return True only if the current UTC hour falls inside a configured
+    liquid trading session (London or New York).
+    Gold spreads widen sharply outside these windows, killing scalp edge.
     """
-    positions = mt5.positions_get(symbol=symbol)
-    if positions is None:
-        # None means API error; treat conservatively as having a position
-        log.warning("positions_get() returned None — %s", mt5.last_error())
-        return True
-    for pos in positions:
-        if pos.magic == MAGIC_NUMBER:
+    now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
+    for start, end in SESSIONS:
+        if start <= hour < end:
             return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# SECTION 7 — ORDER EXECUTION
+# SECTION 6 — STRATEGY SIGNAL ENGINE
+# ---------------------------------------------------------------------------
+
+def compute_signal(df: pd.DataFrame) -> Tuple[str, float]:
+    """
+    XAUUSD M1 Scalping Strategy — EMA 9/21 Cross + RSI(7) + ATR(14)
+
+    Entry rules
+    -----------
+    BUY  : EMA9 crosses above EMA21 on the last closed candle
+           AND RSI(7) > 50  (upside momentum confirmed)
+           AND RSI(7) < 75  (not already overbought)
+
+    SELL : EMA9 crosses below EMA21 on the last closed candle
+           AND RSI(7) < 50  (downside momentum confirmed)
+           AND RSI(7) > 25  (not already oversold)
+
+    SL/TP distances (returned as price distance, not points)
+    ---------------------------------------------------------
+    SL = ATR(14) * SL_ATR_MULT  →  volatility-adaptive stop
+    TP = ATR(14) * TP_ATR_MULT  →  2× the stop (1:2 R/R minimum)
+
+    Returns
+    -------
+    (signal, atr_value) where signal ∈ {'BUY', 'SELL', 'HOLD'}
+    atr_value is the latest ATR (0.0 when HOLD).
+    """
+    min_candles = max(EMA_SLOW, RSI_LEN, ATR_LEN) * 3
+    if len(df) < min_candles:
+        log.warning("Insufficient candles (%d < %d) — HOLD.", len(df), min_candles)
+        return "HOLD", 0.0
+
+    df = compute_indicators(df)
+
+    # Latest and previous completed candle
+    c  = df.iloc[-1]   # current (last closed)
+    p  = df.iloc[-2]   # previous
+
+    fast_cross_up   = (p["ema_fast"] <= p["ema_slow"]) and (c["ema_fast"] > c["ema_slow"])
+    fast_cross_down = (p["ema_fast"] >= p["ema_slow"]) and (c["ema_fast"] < c["ema_slow"])
+
+    rsi  = c["rsi"]
+    atr  = c["atr"]
+
+    log.info(
+        "Indicators | EMA_fast=%.2f EMA_slow=%.2f RSI=%.1f ATR=%.4f",
+        c["ema_fast"], c["ema_slow"], rsi, atr,
+    )
+
+    if fast_cross_up and RSI_BUY_MIN < rsi < RSI_OB:
+        log.info("Signal: BUY  | EMA9 crossed above EMA21 | RSI=%.1f", rsi)
+        return "BUY", atr
+
+    if fast_cross_down and RSI_OS < rsi < RSI_SELL_MAX:
+        log.info("Signal: SELL | EMA9 crossed below EMA21 | RSI=%.1f", rsi)
+        return "SELL", atr
+
+    log.info("Signal: HOLD | no valid crossover + RSI confluence")
+    return "HOLD", 0.0
+
+
+# ---------------------------------------------------------------------------
+# SECTION 7 — DYNAMIC POSITION SIZING
+# ---------------------------------------------------------------------------
+
+def get_account_balance() -> Optional[float]:
+    info = mt5.account_info()
+    if info is None:
+        log.error("account_info() failed — %s", mt5.last_error())
+        return None
+    return info.balance
+
+
+def calculate_lot_size(symbol: str, sl_price_distance: float) -> Optional[float]:
+    """
+    Compute lot size so that hitting the SL costs exactly RISK_FRACTION
+    of the current balance.
+
+    sl_price_distance : SL distance expressed as a raw price difference
+                        (e.g. ATR * SL_ATR_MULT). Converted to points internally.
+
+    Formula:
+        cash_at_risk  = balance × RISK_FRACTION
+        sl_in_ticks   = sl_price_distance / tick_size
+        risk_per_lot  = sl_in_ticks × tick_value
+        lot           = cash_at_risk / risk_per_lot
+    """
+    balance = get_account_balance()
+    if balance is None:
+        return None
+
+    sym = mt5.symbol_info(symbol)
+    if sym is None:
+        log.error("symbol_info() failed for %s — %s", symbol, mt5.last_error())
+        return None
+
+    if not sym.visible:
+        if not mt5.symbol_select(symbol, True):
+            log.error("Cannot select symbol %s.", symbol)
+            return None
+
+    tick_size  = sym.trade_tick_size
+    tick_value = sym.trade_tick_value
+
+    if tick_size == 0 or tick_value == 0:
+        log.error("Bad tick data: tick_size=%s tick_value=%s", tick_size, tick_value)
+        return None
+
+    cash_at_risk = balance * RISK_FRACTION
+    sl_in_ticks  = sl_price_distance / tick_size
+    risk_per_lot = sl_in_ticks * tick_value
+
+    if risk_per_lot <= 0:
+        log.error("risk_per_lot non-positive (%.6f) — cannot size.", risk_per_lot)
+        return None
+
+    raw_lot = cash_at_risk / risk_per_lot
+    lot = max(LOT_MIN, min(LOT_MAX, round(raw_lot - (raw_lot % LOT_STEP), 2)))
+
+    log.info(
+        "Sizing | balance=%.2f | risk=%.0f%% | cash_risk=%.2f | "
+        "SL_dist=%.4f | risk/lot=%.4f | raw=%.4f | lot=%.2f",
+        balance, RISK_FRACTION * 100, cash_at_risk,
+        sl_price_distance, risk_per_lot, raw_lot, lot,
+    )
+    return lot
+
+
+# ---------------------------------------------------------------------------
+# SECTION 8 — POSITION GUARD
+# ---------------------------------------------------------------------------
+
+def has_open_position(symbol: str) -> bool:
+    """True if this bot already holds an open position for `symbol`."""
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        log.warning("positions_get() returned None — %s", mt5.last_error())
+        return True   # conservative: assume open
+    return any(p.magic == MAGIC_NUMBER for p in positions)
+
+
+# ---------------------------------------------------------------------------
+# SECTION 9 — ORDER EXECUTION
 # ---------------------------------------------------------------------------
 
 def get_current_price(symbol: str, order_type: int) -> Optional[float]:
-    """
-    Return the current ASK (for BUY) or BID (for SELL) price.
-    order_type: mt5.ORDER_TYPE_BUY or mt5.ORDER_TYPE_SELL
-    """
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        log.error("symbol_info_tick() failed for %s — %s", symbol, mt5.last_error())
+        log.error("symbol_info_tick() failed — %s", mt5.last_error())
         return None
     return tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
 
-def execute_order(symbol: str, signal: str, lot: float) -> bool:
+def execute_order(symbol: str, signal: str, lot: float, atr: float) -> bool:
     """
-    Send a market order based on the signal direction ('BUY' or 'SELL').
+    Place a market order with ATR-based SL and TP.
 
-    Stop-loss and take-profit are calculated as fixed point distances from
-    the entry price (SL_POINTS / TP_POINTS constants).
-
-    Returns True if the order was successfully accepted, False otherwise.
+    SL distance = ATR × SL_ATR_MULT
+    TP distance = ATR × TP_ATR_MULT   (≥ 1:2 R/R by default)
     """
     if signal not in ("BUY", "SELL"):
-        log.error("execute_order called with invalid signal: %s", signal)
         return False
 
     order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
@@ -294,20 +362,21 @@ def execute_order(symbol: str, signal: str, lot: float) -> bool:
     if price is None:
         return False
 
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
+    sym = mt5.symbol_info(symbol)
+    if sym is None:
         log.error("symbol_info() failed — %s", mt5.last_error())
         return False
 
-    point = symbol_info.point
-    digits = symbol_info.digits
+    digits    = sym.digits
+    sl_dist   = round(atr * SL_ATR_MULT, digits)
+    tp_dist   = round(atr * TP_ATR_MULT, digits)
 
     if signal == "BUY":
-        sl = round(price - SL_POINTS * point, digits)
-        tp = round(price + TP_POINTS * point, digits)
+        sl = round(price - sl_dist, digits)
+        tp = round(price + tp_dist, digits)
     else:
-        sl = round(price + SL_POINTS * point, digits)
-        tp = round(price - TP_POINTS * point, digits)
+        sl = round(price + sl_dist, digits)
+        tp = round(price - tp_dist, digits)
 
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
@@ -319,14 +388,15 @@ def execute_order(symbol: str, signal: str, lot: float) -> bool:
         "tp":           tp,
         "deviation":    SLIPPAGE,
         "magic":        MAGIC_NUMBER,
-        "comment":      f"Bot {signal}",
+        "comment":      f"EMA-RSI-ATR {signal}",
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
     log.info(
-        "Sending %s order | symbol=%s | lot=%.2f | price=%s | sl=%s | tp=%s",
-        signal, symbol, lot, price, sl, tp,
+        "ORDER %s | lot=%.2f | price=%.5f | sl=%.5f | tp=%.5f | "
+        "sl_dist=%.4f | tp_dist=%.4f | ATR=%.4f",
+        signal, lot, price, sl, tp, sl_dist, tp_dist, atr,
     )
 
     result = mt5.order_send(request)
@@ -336,116 +406,139 @@ def execute_order(symbol: str, signal: str, lot: float) -> bool:
 
     if result.retcode == mt5.TRADE_RETCODE_DONE:
         log.info(
-            "Order ACCEPTED | ticket=%s | deal=%s | price=%.5f | lot=%.2f",
+            "ACCEPTED | ticket=%s | deal=%s | fill_price=%.5f | lot=%.2f",
             result.order, result.deal, result.price, result.volume,
         )
         return True
 
     log.error(
-        "Order REJECTED | retcode=%s (%s) | comment=%s",
-        result.retcode, _retcode_description(result.retcode), result.comment,
+        "REJECTED | retcode=%s (%s) | %s",
+        result.retcode, _retcode_str(result.retcode), result.comment,
     )
     return False
 
 
-def _retcode_description(retcode: int) -> str:
-    """Map common MT5 return codes to human-readable strings."""
-    codes = {
-        mt5.TRADE_RETCODE_DONE:            "Done",
-        mt5.TRADE_RETCODE_REQUOTE:         "Requote",
-        mt5.TRADE_RETCODE_REJECT:          "Rejected",
-        mt5.TRADE_RETCODE_CANCEL:          "Cancelled",
-        mt5.TRADE_RETCODE_PLACED:          "Order placed",
-        mt5.TRADE_RETCODE_DONE_PARTIAL:    "Partial fill",
-        mt5.TRADE_RETCODE_ERROR:           "Common error",
-        mt5.TRADE_RETCODE_TIMEOUT:         "Timeout",
-        mt5.TRADE_RETCODE_INVALID:         "Invalid request",
-        mt5.TRADE_RETCODE_INVALID_VOLUME:  "Invalid volume",
-        mt5.TRADE_RETCODE_INVALID_PRICE:   "Invalid price",
-        mt5.TRADE_RETCODE_INVALID_STOPS:   "Invalid stops",
-        mt5.TRADE_RETCODE_NO_MONEY:        "Insufficient funds",
-        mt5.TRADE_RETCODE_PRICE_CHANGED:   "Price changed",
-        mt5.TRADE_RETCODE_OFF_QUOTES:      "Off quotes",
-        mt5.TRADE_RETCODE_CONNECTION:      "No connection",
+def _retcode_str(code: int) -> str:
+    table = {
+        mt5.TRADE_RETCODE_DONE:              "Done",
+        mt5.TRADE_RETCODE_REQUOTE:           "Requote",
+        mt5.TRADE_RETCODE_REJECT:            "Rejected",
+        mt5.TRADE_RETCODE_CANCEL:            "Cancelled",
+        mt5.TRADE_RETCODE_PLACED:            "Placed",
+        mt5.TRADE_RETCODE_DONE_PARTIAL:      "Partial fill",
+        mt5.TRADE_RETCODE_ERROR:             "Error",
+        mt5.TRADE_RETCODE_TIMEOUT:           "Timeout",
+        mt5.TRADE_RETCODE_INVALID:           "Invalid request",
+        mt5.TRADE_RETCODE_INVALID_VOLUME:    "Invalid volume",
+        mt5.TRADE_RETCODE_INVALID_PRICE:     "Invalid price",
+        mt5.TRADE_RETCODE_INVALID_STOPS:     "Invalid stops",
+        mt5.TRADE_RETCODE_NO_MONEY:          "Insufficient funds",
+        mt5.TRADE_RETCODE_PRICE_CHANGED:     "Price changed",
+        mt5.TRADE_RETCODE_OFF_QUOTES:        "Off quotes",
+        mt5.TRADE_RETCODE_CONNECTION:        "No connection",
         mt5.TRADE_RETCODE_TOO_MANY_REQUESTS: "Too many requests",
     }
-    return codes.get(retcode, f"Unknown({retcode})")
+    return table.get(code, f"Unknown({code})")
 
 
 # ---------------------------------------------------------------------------
-# SECTION 8 — MAIN AUTOMATION LOOP
+# SECTION 10 — MAIN AUTOMATION LOOP
 # ---------------------------------------------------------------------------
 
 def run_bot() -> None:
     """
-    Continuous execution loop:
-      1. Fetch market data
-      2. Compute trading signal
-      3. Skip if a position is already open
-      4. Size the position
-      5. Execute the order
-      6. Sleep until the next candle close
+    Main execution loop (runs every 60 seconds — one M1 candle):
+
+      1. Session filter  — skip dead-market hours
+      2. Spread guard    — skip if broker spread is too wide
+      3. Fetch candles   — 300 completed M1 bars
+      4. Compute signal  — EMA cross + RSI + ATR
+      5. Position guard  — no duplicate entries
+      6. Size lot        — ATR-based SL, 20% balance risk
+      7. Execute order   — market order with SL/TP attached
+      8. Sleep           — align to next candle close
     """
-    log.info("=" * 60)
-    log.info("  MT5 Trading Bot started  |  %s", datetime.utcnow().isoformat())
-    log.info("  Symbol=%s  Timeframe=%s  Risk=%.0f%%", SYMBOL, TIMEFRAME, RISK_FRACTION * 100)
-    log.info("=" * 60)
+    log.info("=" * 65)
+    log.info("  XAUUSD M1 SCALPER  |  %s UTC", datetime.utcnow().isoformat())
+    log.info("  Strategy : EMA %d/%d Cross + RSI(%d) + ATR(%d) SL/TP",
+             EMA_FAST, EMA_SLOW, RSI_LEN, ATR_LEN)
+    log.info("  Risk     : %.0f%% per trade | SL×%.1f ATR | TP×%.1f ATR",
+             RISK_FRACTION * 100, SL_ATR_MULT, TP_ATR_MULT)
+    log.info("  Sessions : London 07–12 UTC | New York 13–17 UTC")
+    log.info("=" * 65)
 
     if not connect_mt5():
-        log.critical("Failed to connect to MT5. Exiting.")
+        log.critical("MT5 connection failed. Exiting.")
         sys.exit(1)
 
     try:
         while True:
-            loop_start = datetime.utcnow()
-            log.info("--- Loop tick: %s ---", loop_start.strftime("%Y-%m-%d %H:%M:%S UTC"))
+            tick_start = datetime.utcnow()
+            log.info("── Tick %s ──", tick_start.strftime("%Y-%m-%d %H:%M:%S UTC"))
 
-            # Step 1: Fetch candle data
+            # ── 1. Session filter ──────────────────────────────────────────
+            if not is_active_session():
+                log.info("Outside active session — sleeping 60 s.")
+                time.sleep(LOOP_SLEEP)
+                continue
+
+            # ── 2. Spread guard ────────────────────────────────────────────
+            spread = get_live_spread(SYMBOL)
+            if spread is None:
+                log.warning("Could not read spread — skipping tick.")
+                time.sleep(LOOP_SLEEP)
+                continue
+            if spread > MAX_SPREAD_POINTS:
+                log.info("Spread too wide (%d pts > %d) — skipping tick.",
+                         spread, MAX_SPREAD_POINTS)
+                time.sleep(LOOP_SLEEP)
+                continue
+            log.info("Spread OK: %d pts", spread)
+
+            # ── 3. Fetch candles ───────────────────────────────────────────
             df = fetch_candles(SYMBOL, TIMEFRAME, CANDLES)
             if df is None:
-                log.warning("Skipping tick — could not fetch candles.")
+                log.warning("Candle fetch failed — skipping tick.")
                 time.sleep(LOOP_SLEEP)
                 continue
+            log.info("Candles: %d bars | last close: %s", len(df), df["time"].iloc[-1])
 
-            log.info("Candles fetched: %d rows, latest close time: %s",
-                     len(df), df["time"].iloc[-1])
+            # ── 4. Strategy signal ─────────────────────────────────────────
+            signal, atr = compute_signal(df)
 
-            # Step 2: Generate trading signal
-            signal = compute_signal(df)
-
-            # Step 3: Skip HOLD or if position already open
             if signal == "HOLD":
-                log.info("HOLD — no trade action taken.")
                 time.sleep(LOOP_SLEEP)
                 continue
 
+            # ── 5. Position guard ──────────────────────────────────────────
             if has_open_position(SYMBOL):
-                log.info("Position already open for %s — skipping new entry.", SYMBOL)
+                log.info("Position already open — no new entry.")
                 time.sleep(LOOP_SLEEP)
                 continue
 
-            # Step 4: Calculate lot size with strict risk management
-            lot = calculate_lot_size(SYMBOL, SL_POINTS)
+            # ── 6. Lot sizing ──────────────────────────────────────────────
+            sl_distance = atr * SL_ATR_MULT
+            lot = calculate_lot_size(SYMBOL, sl_distance)
             if lot is None:
-                log.warning("Could not calculate lot size — skipping trade.")
+                log.warning("Lot sizing failed — skipping trade.")
                 time.sleep(LOOP_SLEEP)
                 continue
 
-            # Step 5: Execute the order
-            success = execute_order(SYMBOL, signal, lot)
+            # ── 7. Execute ─────────────────────────────────────────────────
+            success = execute_order(SYMBOL, signal, lot, atr)
             if not success:
                 log.warning("Order execution failed for signal=%s.", signal)
 
-            # Sleep until next iteration
-            elapsed = (datetime.utcnow() - loop_start).total_seconds()
-            sleep_for = max(0, LOOP_SLEEP - elapsed)
-            log.info("Sleeping %.1f seconds until next tick...", sleep_for)
+            # ── 8. Sleep to next candle ────────────────────────────────────
+            elapsed = (datetime.utcnow() - tick_start).total_seconds()
+            sleep_for = max(0.0, LOOP_SLEEP - elapsed)
+            log.info("Sleeping %.1f s to next candle...", sleep_for)
             time.sleep(sleep_for)
 
     except KeyboardInterrupt:
-        log.info("Bot stopped by user (KeyboardInterrupt).")
+        log.info("Stopped by user.")
     except Exception as exc:
-        log.exception("Unhandled exception in main loop: %s", exc)
+        log.exception("Unhandled exception: %s", exc)
     finally:
         shutdown_mt5()
 
